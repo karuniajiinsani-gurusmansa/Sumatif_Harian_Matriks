@@ -869,9 +869,13 @@ function shuffle(arr){
   return arr;
 }
 
-/* Mengubah teks soal: newline -> <br> (aman untuk LaTeX) */
+/* Mengamankan karakter HTML dan mengubah newline menjadi <br> */
 function fmt(s){
-  return String(s).replace(/\r/g,'').replace(/\n/g,'<br>');
+  return String(s)
+    .replace(/\r/g, '')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>');
 }
 
 /* Render ulang rumus MathJax pada elemen tertentu */
