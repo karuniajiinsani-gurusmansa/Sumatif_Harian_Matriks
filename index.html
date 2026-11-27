@@ -568,6 +568,18 @@ body.exam-protected #exam{-webkit-user-select:none;user-select:none}
 body.exam-protected #exam img,body.exam-protected #exam canvas{-webkit-user-drag:none;user-drag:none}
 @media print{body.exam-protected *{visibility:hidden!important}body.exam-protected:before{content:'DOKUMEN UJIAN DILINDUNGI';display:block!important;visibility:visible!important;font-size:32px}}
 
+
+/* FITUR KEANDALAN: status koneksi, penyimpanan lokal, dan status pengiriman */
+.connection-pill{display:inline-flex;align-items:center;gap:7px;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:700;background:#ecfdf5;color:#166534;border:1px solid #bbf7d0}
+.connection-pill.offline{background:#fff7ed;color:#9a3412;border-color:#fed7aa}
+.connection-pill.saving{background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe}
+#submissionStatus{margin:16px auto 0;max-width:700px;padding:13px 15px;border:1px solid var(--border);border-radius:12px;text-align:left;font-size:14px;background:var(--bg)}
+#submissionStatus.success{border-color:#86efac;background:#f0fdf4;color:#166534}
+#submissionStatus.warning{border-color:#fcd34d;background:#fffbeb;color:#92400e}
+#submissionStatus.error{border-color:#fca5a5;background:#fef2f2;color:#991b1b}
+#retrySubmit{margin-top:10px}
+@media(max-width:700px){.connection-pill{font-size:11px;padding:5px 8px}}
+ .connection-pill.checking{opacity:.8}.connection-pill.online{border-color:#86efac;color:#166534}
 </style>
 </head>
 
@@ -728,6 +740,7 @@ body.exam-protected #exam img,body.exam-protected #exam canvas{-webkit-user-drag
       <p id="examInfo" class="muted"></p>
     </div>
     <div class="exam-header-actions">
+      <span id="connectionStatus" class="connection-pill">● Memeriksa server…</span>
       <div id="timer" class="timer hidden">60:00</div>
       <button class="secondary icon-btn" onclick="openLog()" title="Log Aktivitas" aria-label="Log Aktivitas">📋</button>
     </div>
@@ -784,6 +797,8 @@ body.exam-protected #exam img,body.exam-protected #exam canvas{-webkit-user-drag
 <h2 id="resultHeading">Hasil</h2>
 <div class="score" id="score">0</div>
 <p id="resultText"></p>
+<div id="submissionStatus" class="hidden" aria-live="polite"></div>
+<button id="retrySubmit" class="secondary hidden" onclick="retrySubmission()">Kirim Ulang Nilai</button>
 <div class="stats">
 <div><b id="correct">0</b>Benar</div>
 <div><b id="wrong">0</b>Salah/kosong</div>
@@ -825,7 +840,7 @@ body.exam-protected #exam img,body.exam-protected #exam canvas{-webkit-user-drag
    Contoh: 'https://script.google.com/macros/s/AKfycb.../exec'
    Jika dikosongkan, hasil TIDAK dikirim (mode offline).
    ===================================================== */
-const SHEET_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbxRkaq4WmuodP-iIDAwj8QMMIEI2hKPoAVrUjeni74_LbOl1I4X9I3rsyYSX_ZDUOG-/exec';
+const SHEET_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbx5zGCf30FwUpxSOO-rDpeq0z8TBWZ67x8KvmgXWqfdDaWHRv1TDaqqxecgw3U6FcbI/exec';
 
 /* =====================================================
    STATE APLIKASI
@@ -843,7 +858,11 @@ const S = {
   startAt: 0,
   active: false,
   violations: 0,
-  logs: []
+  logs: [],
+  attemptId: '',
+  deadlineAt: null,
+  submissionPayload: null,
+  submissionState: 'idle'
 };
 
 const TRYOUT_COUNT = 5;
@@ -902,10 +921,9 @@ function toast(msg){
    ===================================================== */
 function getClassConfig(kelas){
   const k = String(kelas || '').toUpperCase().replace(/\s+/g,' ').trim();
-  const isIPS = k.includes('IPS');
-  return isIPS
-    ? { program:'IPS', jumlah:15, waktu:60 }
-    : { program:'IPA', jumlah:20, waktu:60 };
+  if (/^XI IPS [1-4]$/.test(k)) return { program:'IPS', jumlah:15, waktu:60 };
+  if (/^XI IPA [1-8]$/.test(k)) return { program:'IPA', jumlah:20, waktu:60 };
+  return null;
 }
 
 /* =====================================================
@@ -942,9 +960,12 @@ function enterApp(){
   if(!nama){ toast('Nama lengkap belum diisi.'); return; }
   if(!kelas){ toast('Kelas belum dipilih.'); return; }
   if(!absen){ toast('Nomor absen belum diisi.'); return; }
+  if(!/^\d+$/.test(absen) || Number(absen)<1){ toast('Nomor absen harus berupa bilangan bulat positif.'); return; }
+  const cfg = getClassConfig(kelas);
+  if(!cfg){ toast('Kelas tidak dikenali. Pilih kelas yang tersedia.'); return; }
 
   S.student = { nama, kelas, absen };
-  S.cfg = getClassConfig(kelas);
+  S.cfg = cfg;
   loadTheme();
   renderDashboard();
 
@@ -959,6 +980,7 @@ function enterApp(){
   hideEl('result');
   showEl('menu');
   window.scrollTo({ top: 0, behavior: 'smooth' });
+  offerResume();
 }
 
 function backIdentity(){
@@ -1023,6 +1045,117 @@ function logActivity(msg){
 }
 
 /* =====================================================
+   PENYIMPANAN LOKAL & PEMULIHAN SESI
+   Catatan: data tersimpan di browser/perangkat yang sama, bukan di server.
+   ===================================================== */
+const DRAFT_KEY = 'sumatifMatriks_activeDraft_v2';
+const PENDING_KEY = 'sumatifMatriks_pendingSubmission_v1';
+function saveDraft(){
+  if(!S.active || !S.questions.length) return;
+  const draft={version:2,student:S.student,cfg:S.cfg,mode:S.mode,questions:S.questions,
+    answers:S.answers,flags:S.flags,current:S.current,remaining:S.remaining,
+    deadlineAt:S.deadlineAt,startAt:S.startAt,violations:S.violations,logs:S.logs,
+    attemptId:S.attemptId,savedAt:Date.now()};
+  try{localStorage.setItem(DRAFT_KEY,JSON.stringify(draft));}
+  catch(e){logActivity('Penyimpanan lokal gagal: ruang penyimpanan browser tidak tersedia.');}
+}
+function readDraft(){
+  try{const raw=localStorage.getItem(DRAFT_KEY);return raw?JSON.parse(raw):null;}catch(e){return null;}
+}
+function clearDraft(){try{localStorage.removeItem(DRAFT_KEY);}catch(e){}}
+function offerResume(){
+  let pending=null;
+  try{pending=JSON.parse(localStorage.getItem(PENDING_KEY)||'null');}catch(e){}
+  if(pending && pending.nama===S.student.nama && pending.kelas===S.student.kelas && String(pending.nomorAbsen)===String(S.student.absen)){
+    openModal('Pengiriman nilai tertunda',
+      `<p>Ditemukan hasil ujian sebelumnya yang belum berhasil dikirim dari browser ini.</p><p>Ujian: <b>${esc(pending.kelas)}</b> • ${esc(pending.nama)}</p><p class="muted">Tekan kirim ulang setelah memastikan koneksi internet tersedia. Periksa spreadsheet setelah pengiriman.</p>`,
+      'Kirim Ulang Nilai',()=>{S.submissionPayload=pending;S.submissionState='failed';sendToSheet(pending);},'Nanti');
+    return;
+  }
+  const d=readDraft();
+  if(!d || d.version!==2 || !d.student || d.student.nama!==S.student.nama ||
+     d.student.kelas!==S.student.kelas || String(d.student.absen)!==String(S.student.absen)) return;
+  const expired=d.mode==='official' && d.deadlineAt && Date.now()>=d.deadlineAt;
+  if(expired){clearDraft();toast('Sesi ujian sebelumnya sudah melewati batas waktu dan tidak dapat dipulihkan.');return;}
+  openModal('Sesi ujian tersimpan',
+    `<p>Ditemukan sesi ${d.mode==='official'?'Sumatif Harian':'TRY OUT'} yang belum selesai.</p>
+     <p>Jawaban terakhir tersimpan pada <b>${new Date(d.savedAt).toLocaleString('id-ID')}</b>.</p>
+     <p class="muted">Pemulihan hanya tersedia pada browser dan perangkat yang sama. Waktu ujian tetap berjalan.</p>`,
+    'Pulihkan Ujian',()=>restoreDraft(d),'Abaikan');
+}
+function restoreDraft(d){
+  if(!d || !Array.isArray(d.questions) || !Array.isArray(d.answers) || d.questions.length!==d.answers.length){
+    clearDraft();toast('Data sesi tidak valid dan tidak dapat dipulihkan.');return;
+  }
+  S.student=d.student;S.cfg=d.cfg;S.mode=d.mode;S.questions=d.questions;S.answers=d.answers;
+  S.flags=Array.isArray(d.flags)?d.flags:new Array(d.questions.length).fill(false);
+  S.current=Math.min(Math.max(0,Number(d.current)||0),d.questions.length-1);
+  S.startAt=d.startAt||Date.now();S.violations=Number(d.violations)||0;S.logs=Array.isArray(d.logs)?d.logs:[];
+  S.attemptId=d.attemptId||createAttemptId();S.deadlineAt=d.deadlineAt||null;S.active=true;
+  document.body.classList.toggle('exam-protected',S.mode==='official');
+  hideEl('menu');hideEl('identity');hideEl('cpTp');hideEl('result');showEl('exam');
+  $('examName').textContent=S.mode==='tryout'?'TRY OUT — Latihan Matriks':'Sumatif Harian Matriks';
+  $('examInfo').textContent=`${S.student.nama} • ${S.student.kelas} • ${S.questions.length} soal (dipulihkan)`;
+  $('examWarning').classList.toggle('hidden',S.mode!=='official');
+  if(S.mode==='official'){
+    const left=Math.max(0,Math.ceil((S.deadlineAt-Date.now())/1000));
+    if(left<=0){submitExam('Waktu habis saat pemulihan sesi');return;}
+    $('timer').classList.remove('hidden');startTimer(left,false);
+  }else{$('timer').classList.add('hidden');clearInterval(S.timerId);}
+  renderNav();renderQuestion();logActivity('Sesi ujian dipulihkan dari penyimpanan lokal.');
+  updateConnectionStatus();window.scrollTo({top:0});
+}
+function createAttemptId(){
+  try{return crypto.randomUUID();}catch(e){return 'MAT-'+Date.now()+'-'+Math.random().toString(36).slice(2,10);}
+}
+let serverCheckBusy=false;
+function updateConnectionStatus(state,message){
+  const el=$('connectionStatus');if(!el)return;
+  if(state==='checking'){el.textContent='● Memeriksa server…';el.classList.remove('offline');el.classList.add('checking');return;}
+  if(state==='server'){
+    el.textContent='● Server terhubung';el.classList.remove('offline','checking');el.classList.add('online');return;
+  }
+  if(state==='offline'){
+    el.textContent='● Perangkat offline';el.classList.add('offline');el.classList.remove('checking','online');return;
+  }
+  el.textContent='● Server tidak terjangkau';el.classList.add('offline');el.classList.remove('checking','online');
+}
+function jsonpRequest(params,timeoutMs=8000){
+  return new Promise((resolve,reject)=>{
+    const callback='__matriksJsonp_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+    const script=document.createElement('script');let done=false;
+    const cleanup=()=>{if(script.parentNode)script.parentNode.removeChild(script);try{delete window[callback];}catch(e){window[callback]=undefined;}clearTimeout(timer);};
+    const finish=(ok,value)=>{if(done)return;done=true;cleanup();ok?resolve(value):reject(value);};
+    window[callback]=data=>finish(true,data);
+    const query=new URLSearchParams({...params,callback,_:Date.now()});
+    script.src=SHEET_WEBAPP_URL+'?'+query.toString();
+    script.onerror=()=>finish(false,new Error('Server tidak merespons'));
+    const timer=setTimeout(()=>finish(false,new Error('Waktu pemeriksaan server habis')),timeoutMs);
+    document.head.appendChild(script);
+  });
+}
+async function checkServerConnection(){
+  if(serverCheckBusy)return;
+  if(!navigator.onLine){updateConnectionStatus('offline');return;}
+  if(!SHEET_WEBAPP_URL){updateConnectionStatus('unreachable');return;}
+  serverCheckBusy=true;updateConnectionStatus('checking');
+  try{const r=await jsonpRequest({action:'ping'});updateConnectionStatus(r&&r.ok?'server':'unreachable');}
+  catch(e){updateConnectionStatus('unreachable');}
+  finally{serverCheckBusy=false;}
+}
+async function waitForSavedResult(attemptId){
+  for(let i=0;i<7;i++){
+    try{const r=await jsonpRequest({action:'status',attemptId},7000);if(r&&r.ok&&r.saved)return r;}
+    catch(e){}
+    await new Promise(resolve=>setTimeout(resolve,1800));
+  }
+  return null;
+}
+window.addEventListener('online',()=>{checkServerConnection();if(S.active)logActivity('Koneksi internet kembali tersedia.');});
+window.addEventListener('offline',()=>{updateConnectionStatus('offline');if(S.active)logActivity('Koneksi internet terputus. Jawaban tetap disimpan di perangkat ini.');});
+checkServerConnection();setInterval(checkServerConnection,30000);
+
+/* =====================================================
    INSTRUKSI & MULAI
    ===================================================== */
 function showInstructions(mode){
@@ -1038,7 +1171,9 @@ function showInstructions(mode){
       <li>Waktu: <b>${menit > 0 ? menit + ' menit' : 'tanpa batas waktu'}</b></li>
       <li>Soal dan pilihan jawaban <b>diacak</b>.</li>
       <li>Gunakan tombol <b>⚑ Ragu</b> untuk menandai soal yang ingin ditinjau.</li>
-      <li>Jawaban terkirim otomatis saat waktu habis.</li>
+      <li>Jawaban disimpan otomatis di browser perangkat ini.</li>
+      <li>Jika halaman dimuat ulang, sesi dapat dipulihkan selama data browser tidak dihapus dan waktu belum habis.</li>
+      <li>Pengiriman nilai membutuhkan koneksi internet.</li>
       ${isTry
         ? '<li>Mode latihan: nilai tampil setelah selesai, tidak dikirim ke spreadsheet.</li>'
         : '<li><b>Jangan berpindah tab.</b> Setiap pelanggaran dicatat (maks. 5 → ujian dihentikan).</li>'}
@@ -1126,6 +1261,7 @@ function buildQuestions(count){
    MULAI UJIAN
    ===================================================== */
 function startExam(){
+  if(S.mode==='official' && !navigator.onLine){toast('Ujian sumatif harus dimulai dengan koneksi internet aktif. Periksa jaringan lalu coba kembali.');return;}
   prepareAlarmAudio();
   document.body.classList.toggle('exam-protected', S.mode === 'official');
   const isTry  = (S.mode === 'tryout');
@@ -1140,6 +1276,9 @@ function startExam(){
   S.violations= 0;
   S.logs      = [];
   S.startAt   = Date.now();
+  S.attemptId = createAttemptId();
+  S.deadlineAt= menit>0 ? Date.now()+menit*60*1000 : null;
+  S.submissionPayload=null;S.submissionState='idle';
   S.active    = true;
 
     hideEl('menu'); hideEl('result'); hideEl('identity'); hideEl('cpTp'); showEl('exam');
@@ -1155,7 +1294,7 @@ function startExam(){
 
   if (menit > 0){
     $('timer').classList.remove('hidden');
-    startTimer(menit * 60);
+    startTimer(menit * 60, false);
   } else {
     $('timer').classList.add('hidden');
     clearInterval(S.timerId);
@@ -1165,6 +1304,7 @@ function startExam(){
   renderQuestion();
 
   logActivity(`Ujian dimulai — ${S.student.nama} (${S.student.kelas}), ${S.questions.length} soal`);
+  saveDraft();updateConnectionStatus();
   window.scrollTo({ top: 0 });
 }
 
@@ -1212,6 +1352,7 @@ function selectOption(idx){
   updateProgress();
   renderNav();
   logActivity(`Soal ${S.current + 1} dijawab: ${'ABCDE'[idx]}`);
+  saveDraft();
 }
 
 function updateProgress(){
@@ -1238,7 +1379,7 @@ function renderNav(){
 function goToQuestion(i){
   if (i < 0 || i >= S.questions.length) return;
   S.current = i;
-  renderQuestion();
+  renderQuestion();saveDraft();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -1256,19 +1397,22 @@ function toggleFlag(){
   S.flags[S.current] = !S.flags[S.current];
   renderNav();
   logActivity(`Soal ${S.current + 1} ${S.flags[S.current] ? 'ditandai ragu-ragu' : 'tanda ragu dihapus'}`);
+  saveDraft();
 }
 
 /* =====================================================
    TIMER
    ===================================================== */
-function startTimer(seconds){
+function startTimer(seconds, resetDeadline=true){
   clearInterval(S.timerId);
-  S.remaining = seconds;
+  if(resetDeadline || !S.deadlineAt) S.deadlineAt=Date.now()+seconds*1000;
+  S.remaining = Math.max(0,Math.ceil((S.deadlineAt-Date.now())/1000));
   updateTimerDisplay();
 
   S.timerId = setInterval(() => {
-    S.remaining--;
+    S.remaining = Math.max(0,Math.ceil((S.deadlineAt-Date.now())/1000));
     updateTimerDisplay();
+    if(S.remaining%10===0) saveDraft();
 
     if (S.remaining === 300) logActivity('Sisa waktu 5 menit');
     if (S.remaining === 60)  logActivity('Sisa waktu 1 menit');
@@ -1358,7 +1502,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 window.addEventListener('blur', () => {
-  handleViolation('Jendela ujian kehilangan fokus');
+  if(S.active && S.mode==='official') logActivity('Jendela kehilangan fokus (dicatat sebagai informasi, tidak otomatis menambah pelanggaran).');
 });
 
 document.addEventListener('keydown', (e) => {
@@ -1378,6 +1522,7 @@ document.addEventListener('contextmenu', (e) => {
 
 window.addEventListener('beforeunload', (e) => {
   if (S.active) {
+    saveDraft();
     e.preventDefault();
     e.returnValue = '';
     return '';
@@ -1458,6 +1603,7 @@ function submitExam(reason){
 
   const payload = {
     waktuKirim: new Date().toISOString(),
+    attemptId: S.attemptId || createAttemptId(),
     nama: S.student.nama,
     kelas: S.student.kelas,
     nomorAbsen: S.student.absen,
@@ -1473,11 +1619,15 @@ function submitExam(reason){
     rincian: rincian
   };
 
+  S.submissionPayload=payload;
+  clearDraft();
   if (S.mode === 'official'){
+    S.submissionState='sending';
+    showResult(nilai, benar, total, durasiDetik, reason);
     sendToSheet(payload);
+  } else {
+    showResult(nilai, benar, total, durasiDetik, reason);
   }
-
-  showResult(nilai, benar, total, durasiDetik, reason);
 }
 
 function showResult(nilai, benar, total, durasiDetik, reason){
@@ -1503,8 +1653,10 @@ function showResult(nilai, benar, total, durasiDetik, reason){
   else ket = 'Perlu belajar lagi. Ulangi materi matriks dan latihan soal.';
 
   $('resultText').innerHTML =
-    `${total} soal • ${(S.mode === 'tryout') ? 'Mode latihan (tidak dikirim)' : 'Nilai telah dikirim ke spreadsheet'}.<br>
+    `${total} soal • ${(S.mode === 'tryout') ? 'Mode latihan (tidak dikirim)' : 'Hasil sumatif sedang diproses untuk dikirim'}.<br>
      <span class="muted">${esc(reason)}</span><br><b>${ket}</b>`;
+  if(S.mode==='official') setSubmissionStatus('warning','Mengirim permintaan hasil ujian. Karena browser menggunakan mode no-cors, aplikasi tidak dapat membaca konfirmasi penyimpanan dari Google Apps Script. Periksa spreadsheet untuk memastikan baris nilai sudah masuk.');
+  else {hideEl('submissionStatus');hideEl('retrySubmit');}
 
   typeset();
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1513,23 +1665,48 @@ function showResult(nilai, benar, total, durasiDetik, reason){
 /* =====================================================
    KIRIM KE SPREADSHEET (Google Apps Script)
    ===================================================== */
-function sendToSheet(payload){
-  if (!SHEET_WEBAPP_URL) {
-    logActivity('Pengiriman dilewati: SHEET_WEBAPP_URL belum diisi');
-    return;
+function setSubmissionStatus(type,message,showRetry=false){
+  const el=$('submissionStatus');if(!el)return;
+  el.className=type;el.textContent=message;showEl('submissionStatus');
+  $('retrySubmit').classList.toggle('hidden',!showRetry);
+}
+async function sendToSheet(payload){
+  try{localStorage.setItem(PENDING_KEY,JSON.stringify(payload));}catch(e){}
+  if(!SHEET_WEBAPP_URL){
+    S.submissionState='failed';setSubmissionStatus('error','URL Google Apps Script belum diatur. Nilai belum dikirim.',false);return;
   }
-  try {
-    fetch(SHEET_WEBAPP_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload)
-    })
-    .then(() => logActivity('Hasil ujian dikirim ke spreadsheet'))
-    .catch(err => logActivity('Gagal mengirim ke spreadsheet: ' + err.message));
-  } catch (e) {
-    logActivity('Gagal mengirim ke spreadsheet: ' + e.message);
+  if(!navigator.onLine){
+    S.submissionState='failed';setSubmissionStatus('error','Perangkat sedang offline. Nilai tersimpan sementara di browser. Sambungkan internet lalu tekan Kirim Ulang Nilai.',true);return;
   }
+  S.submissionState='sending';setSubmissionStatus('warning','Mengirim nilai dan menunggu konfirmasi penyimpanan server…');
+  try{
+    await fetch(SHEET_WEBAPP_URL,{
+      method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(payload),keepalive:true
+    });
+    const confirmed=await waitForSavedResult(payload.attemptId);
+    if(confirmed&&confirmed.saved){
+      S.submissionState='saved';try{localStorage.removeItem(PENDING_KEY);}catch(e){}
+      setSubmissionStatus('success','Nilai berhasil tersimpan di sheet '+(confirmed.sheet||payload.kelas)+'. ID pengiriman: '+payload.attemptId,false);
+      logActivity('Server mengonfirmasi nilai tersimpan pada sheet '+(confirmed.sheet||payload.kelas)+'.');
+    }else{
+      S.submissionState='pending';
+      setSubmissionStatus('warning','Permintaan sudah dikirim, tetapi konfirmasi penyimpanan belum diterima. Data tetap disimpan di browser. Tekan Kirim Ulang Nilai untuk mencoba kembali; server mencegah baris ganda berdasarkan ID pengiriman.',true);
+      logActivity('Konfirmasi penyimpanan belum diterima; data dipertahankan untuk pengiriman ulang.');
+    }
+  }catch(err){
+    S.submissionState='failed';
+    setSubmissionStatus('error','Pengiriman belum dapat dikonfirmasi: '+(err&&err.message?err.message:'koneksi bermasalah')+'. Data tetap tersimpan di browser; coba kirim ulang.',true);
+    logActivity('Pengiriman gagal atau belum terkonfirmasi.');
+  }
+}
+function retrySubmission(){
+  if(!S.submissionPayload){
+    try{S.submissionPayload=JSON.parse(localStorage.getItem(PENDING_KEY)||'null');}catch(e){}
+  }
+  if(!S.submissionPayload){toast('Data hasil ujian tidak tersedia untuk dikirim ulang.');return;}
+  if(S.submissionState==='sending'){toast('Pengiriman masih berlangsung.');return;}
+  sendToSheet(S.submissionPayload);
 }
 
 /* =====================================================
@@ -3326,6 +3503,10 @@ const QUESTION_BANK = [
 }
 
 ];
+
+// Status koneksi diperbarui saat aplikasi dibuka.
+document.addEventListener('DOMContentLoaded',updateConnectionStatus);
+updateConnectionStatus();
 </script>
 
 <div id="securityOverlay" role="alertdialog" aria-modal="true" aria-labelledby="securityTitle">
